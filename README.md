@@ -1,6 +1,8 @@
 # Zig-Cassowary
 
-A port of the Cassowary constraint solver "Kiwi" to zig.
+[![Build Status](https://travis-ci.org/frmdstryr/zig-cassowary.svg?branch=master)](https://travis-ci.org/frmdstryr/zig-cassowary)
+
+A port of the Cassowary constraint solver [Kiwi](https://github.com/nucleic/kiwi) to zig.
 
 The two main differences from Kiwi are that shared data pointers are not used
 and zig doesn't support operator overloading or the allocator "magic" of C++.
