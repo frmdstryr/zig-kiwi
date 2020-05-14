@@ -702,8 +702,8 @@ pub const Solver = struct {
 
     // Remove a constraint from the solver.
     pub fn removeConstraint(self: *Solver, constraint: *Constraint) !void {
-        if (self.cns.popOrNull(constraint)) |entry| {
-            const tag = &entry.value;
+        if (self.cns.remove(constraint)) |e| {
+            const tag = &e.value;
 
             // Remove the error effects from the objective function
             // *before* pivoting, or substitutions into the objective
@@ -712,10 +712,10 @@ pub const Solver = struct {
 
             // If the marker is basic, simply drop the row. Otherwise,
             // pivot the marker into the basis and then drop the row.
-            if (self.rows.popOrNull(tag.marker)) |entry| {
+            if (self.rows.remove(tag.marker)) |_| {
                 // Already removed
             } else if (self.getMarkerLeavingRow(tag.marker)) |entry| {
-                _ = self.rows.remove(entry);
+                _ = self.rows.remove(entry.key);
                 const row = &entry.value;
                 try row.solveFor(entry.key, tag.marker);
                 try self.substitute(tag.marker, row);
@@ -783,7 +783,7 @@ pub const Solver = struct {
     // - UnknownVariable
     //   The given edit variable has not been added to the solver.
     pub fn removeVariable(self: *Solver, variable: *Variable) !void {
-        if (self.edits.popOrNull(variable)) |entry| {
+        if (self.edits.remove(variable)) |entry| {
             const constraint = entry.value.constraint;
             try self.removeConstraint(constraint);
             constraint.deinit();
@@ -870,7 +870,7 @@ pub const Solver = struct {
         self.cns.clear();
         self.vars.clear();
         self.edits.clear();
-        self.infeasible_rows.clear();
+        self.infeasible_rows.deinit();
         self.objective.deinit();
         self.objective = Row.init(self.allocator);
         self.artificial = null;
@@ -881,9 +881,11 @@ pub const Solver = struct {
     // Internal API
     // -----------------------------------------------------------------------
     fn clearRows(self: *Solver) void {
-        while (self.rows.pop()) |row| {
-            row.deinit();
+        var it = self.rows.iterator();
+        while (it.next()) |entry| {
+            entry.value.deinit();
         }
+        self.rows.clear();
     }
 
     // Get the symbol for the given variable.
@@ -1219,9 +1221,9 @@ pub const Solver = struct {
     // If the marker does not exist in any row, null will be returned.
     // This indicates an internal solver error since
     // the marker *should* exist somewhere in the tableau.
-    fn getMarkerLeavingRow(self: *Solver, marker: *Symbol) ?*RowMap.KV {
-        var r1 = std.math.f32_max;
-        var r2 = std.math.f32_max;
+    fn getMarkerLeavingRow(self: *Solver, marker: Symbol) ?*RowMap.KV {
+        var r1: f32 = std.math.f32_max;
+        var r2: f32 = std.math.f32_max;
         var first: ?*RowMap.KV = null;
         var second: ?*RowMap.KV = null;
         var third: ?*RowMap.KV = null;
@@ -1253,7 +1255,7 @@ pub const Solver = struct {
     }
 
     // Remove the effects of a constraint on the objective function.
-    fn removeConstraintEffects(self: *Solver, cn: *Constraint, tag: *Tag) !void {
+    fn removeConstraintEffects(self: *Solver, cn: *Constraint, tag: *const Tag) !void {
         if (tag.marker.tp == .Error) {
             try self.removeMarkerEffects(tag.marker, cn.strength);
         }
@@ -1264,7 +1266,11 @@ pub const Solver = struct {
 
     // Remove the effects of an error marker on the objective function.
     fn removeMarkerEffects(self: *Solver, marker: Symbol, strength: f32) !void {
-        _ = try self.rows.put(marker, -strength);
+        if (self.rows.get(marker)) |entry| {
+            try self.objective.insertRow(&entry.value, -strength);
+        } else {
+            try self.objective.insertSymbol(marker, -strength);
+        }
     }
 
 
@@ -1450,6 +1456,48 @@ test "constraints" {
 
 }
 
+
+test "solver-variable-managment" {
+    const testing = std.testing;
+    const allocator = std.heap.page_allocator;
+    var solver = Solver.init(allocator);
+    var v1 = Variable{.name="v1"};
+    var v2 = Variable{.name="v2"};
+
+    testing.expect(!solver.hasVariable(&v1));
+
+    try solver.addVariable(&v1, Strength.medium);
+    testing.expectEqual(solver.cns.size, 1);
+    testing.expectEqual(solver.edits.size, 1);
+    testing.expectEqual(solver.rows.size, 1);
+    testing.expect(solver.edits.contains(&v1));
+
+    testing.expect(solver.hasVariable(&v1));
+
+    testing.expectError(error.DuplicateVariable,
+        solver.addVariable(&v1, Strength.medium));
+
+    testing.expectError(error.BadRequiredStrength,
+        solver.addVariable(&v2, Strength.required));
+
+    // Not yet added
+    testing.expect(!solver.hasVariable(&v2));
+    testing.expectError(error.UnknownVariable,
+        solver.removeVariable(&v2));
+
+    testing.expectEqual(solver.cns.size, 1); // Should still be 1
+
+    try solver.addVariable(&v2, Strength.medium);
+    testing.expect(solver.hasVariable(&v2));
+    testing.expectEqual(solver.cns.size, 2);
+
+    try solver.removeVariable(&v1);
+    testing.expect(!solver.hasVariable(&v1));
+
+    solver.reset();
+    testing.expect(!solver.hasVariable(&v2));
+}
+
 test "suggestions" {
     const testing = std.testing;
     var buf: [10000]u8 = undefined;
@@ -1460,19 +1508,6 @@ test "suggestions" {
 
     // This builds a constraint
     try solver.addVariable(&v1, Strength.medium);
-    testing.expectEqual(solver.cns.size, 1);
-    testing.expectEqual(solver.edits.size, 1);
-    testing.expectEqual(solver.rows.size, 1);
-    testing.expect(solver.edits.contains(&v1));
-
-    testing.expectError(error.DuplicateVariable,
-        solver.addVariable(&v1, Strength.medium));
-
-    testing.expectError(error.BadRequiredStrength,
-        solver.addVariable(&v2, Strength.required));
-
-    testing.expectEqual(solver.cns.size, 1); // Should still be 1
-
 
     //var c = try v1.eql(allocator, 1, Strength.weak);
     //defer c.deinit();
