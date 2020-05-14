@@ -67,7 +67,7 @@ pub const Term = struct {
     coefficient: f32 = 1.0,
     variable: *Variable,
 
-    pub inline fn value(self: *Term) f32 {
+    pub inline fn value(self: *const Term) f32 {
         return self.coefficient * self.variable.value;
     }
 
@@ -117,7 +117,6 @@ pub const Term = struct {
 //                value: var, strength: f32) !Constraint {
 //         return self.buildConstraint(allocator, .gte, value, strength);
 //     }
-
 };
 
 
@@ -127,20 +126,36 @@ pub const Expression = struct {
     terms: Terms,
     constant: f32 = 0.0,
 
-    // Create an expression from a slice of terms
+    // Create a reduced expression from a slice of terms
     pub fn init(allocator: *Allocator, args: []Term) !Expression {
-        var terms = try Terms.initCapacity(allocator, args.len);
-        for (args) |arg| {
-            terms.appendAssumeCapacity(arg);
+        return initConstant(allocator, args, 0.0);
+    }
+
+    // Create a reduced expression from a slice of terms with a constant
+    pub fn initConstant(allocator: *Allocator, args: []Term, constant: f32) !Expression {
+        var vars = Vars.init(allocator);
+        defer vars.deinit();
+        for (args) |term| {
+            var entry = try vars.getOrPutValue(term.variable, 0.0);
+            entry.value += term.coefficient;
+        }
+        var terms = try Terms.initCapacity(allocator, vars.size);
+        var it = vars.iterator();
+        while (it.next()) |entry| {
+            terms.appendAssumeCapacity(Term{
+                .variable=entry.key,
+                .coefficient=entry.value
+            });
         }
         return Expression{
             .terms = terms,
+            .constant = constant,
         };
     }
 
     // Create a reduced expression by from the terms of an existing expression
     // For example 3x + 2x + y will be reduced to two terms 5x + y
-    pub fn reduce(allocator: *Allocator, expr: *Expression) !Expression {
+    pub fn reduce(expr: *Expression, allocator: *Allocator) !Expression {
         var vars = Vars.init(allocator);
         defer vars.deinit();
         for (expr.terms.items) |term| {
@@ -165,9 +180,8 @@ pub const Expression = struct {
         self.terms.deinit();
     }
 
-
     // Evaluate the expression using the variable's values
-    pub fn value(self: *Expression) f32 {
+    pub fn value(self: *const Expression) f32 {
         var result = self.constant;
         for (self.terms.items) |term| {
             result += term.value();
@@ -177,10 +191,10 @@ pub const Expression = struct {
 
     // -----------------------------------------------------------------------
     // Multiply, Divide, and Invert
-    // -----------------------------------------------------------------------
+    // ---------------size--------------------------------------------------------
     pub fn mul(self: *Expression, allocator: *Allocator, coefficient: f32) !Expression {
         var terms = try Terms.initCapacity(allocator, self.terms.items.len);
-        for (self.terms.items) |term| {
+        for (self.terms.items) |*term| {
             terms.appendAssumeCapacity(term.mul(coefficient));
         }
         return Expression{
@@ -201,32 +215,47 @@ pub const Expression = struct {
     // -----------------------------------------------------------------------
     // Add and subtract
     // -----------------------------------------------------------------------
-    pub fn add(self: *Expression, allocator: *Allocator, value: var) !Expression {
-        comptime const T = @TypeOf(value);
-        comptime const is_expr = T == Expression;
-        comptime const add_constant = is_expr or !(T == Term or T==Variable);
-        const size = self.terms.items.len + (if (is_expr) value.terms.items.len else 1);
+    pub fn addAndMul(self: *Expression, allocator: *Allocator,
+                     other: var, coefficient: f32) !Expression {
+        comptime const T = @TypeOf(other);
+
+        const size = self.terms.items.len + switch(T) {
+            Expression => other.terms.items.len,
+            *Term, *Variable => 1,
+            Term, Variable => @compileError("Pass the Term/Variable as a reference"),
+            else => 0,
+        };
+
+        // TODO: Optimize this by avoiding creating two sets of terms
         var terms = try Terms.initCapacity(allocator, size);
+        defer terms.deinit();
         for (self.terms.items) |term| {
             terms.appendAssumeCapacity(term);
         }
-        if (is_expr) {
-            for (value.terms.items) |term| {
-                terms.appendAssumeCapacity(term);
+        var constant: f32 = self.constant;
+        switch (T) {
+            Expression => {
+                for (other.terms.items) |*term| {
+                    terms.appendAssumeCapacity(term.mul(coefficient));
+                }
+                constant += other.constant * coefficient;
+            },
+            *Term, *Variable => {
+                terms.appendAssumeCapacity(other.mul(coefficient));
+            },
+            else => {
+                constant += @as(f32, other) * coefficient;
             }
-        } else {
-            terms.appendAssumeCapacity(Term.init(value));
         }
-        const constant =
-            if (add_constant)
-                self.constant + if (is_expr) value.constant else @as(f32, value)
-            else
-                self.constant;
+        return Expression.initConstant(allocator, terms.items, constant);
+    }
 
-        return Expression{
-            .terms = terms,
-            .constant = constant,
-        };
+    pub fn add(self: *Expression, allocator: *Allocator, other: var) !Expression {
+        return self.addAndMul(allocator, other, 1);
+    }
+
+    pub fn sub(self: *Expression, allocator: *Allocator, other: var) !Expression {
+        return self.addAndMul(allocator, other, -1);
     }
 
 };
@@ -1260,6 +1289,107 @@ test "strength" {
     testing.expectEqual(smedium, 100000.0);
 }
 
+test "variables" {
+    const testing = std.testing;
+    var v1 = Variable{.name="v1"};
+
+    var t = v1.invert();
+    testing.expectEqual(t.coefficient, -1);
+
+    t = v1.mul(3);
+    testing.expectEqual(t.coefficient, 3);
+
+    t = v1.div(2);
+    testing.expectEqual(t.coefficient, 0.5);
+
+    testing.expectEqual(t.variable, &v1);
+}
+
+test "terms" {
+    const testing = std.testing;
+    var x = Variable{.name="x", .value=2.0};
+    var t1 = Term{.variable=&x};
+
+    var t2 = t1.mul(3);
+    testing.expectEqual(t2.coefficient, 3.0);
+    testing.expectEqual(t2.variable, t1.variable);
+    testing.expectEqual(t2.value(), 6.0);
+
+    t2 = t1.div(2);
+    testing.expectEqual(t2.coefficient, 0.5);
+    testing.expectEqual(t2.value(), 1.0);
+
+    t2 = t1.invert();
+    testing.expectEqual(t2.coefficient, -1);
+    testing.expectEqual(t2.value(), -2.0);
+}
+
+test "expressions" {
+    const allocator = std.heap.page_allocator;
+    const testing = std.testing;
+    var x = Variable{.name="x", .value=1.0};
+    var y = Variable{.name="y", .value=3.0};
+    var z = Variable{.name="z", .value=2.0};
+    var expr = try Expression.init(allocator, &[_]Term{
+        Term{.variable=&x},
+        Term{.variable=&y},
+    });
+    testing.expectEqual(expr.terms.items.len, 2);
+    testing.expectEqual(expr.value(), 4.0);
+    expr.deinit();
+
+    expr = try Expression.init(allocator, &[_]Term{
+        x.mul(2),
+        x.mul(4),
+    });
+    testing.expectEqual(expr.terms.items.len, 1);
+    testing.expectEqual(expr.value(), 6.0);
+
+    // 6x * 3
+    var expr2 = try expr.mul(allocator, 3);
+    testing.expectEqual(expr2.value(), 18.0);
+    expr2.deinit();
+
+    // 6x / 2
+    expr2 = try expr.div(allocator, 2);
+    testing.expectEqual(expr2.value(), 3.0);
+    expr2.deinit();
+
+    // -6x
+    expr2 = try expr.invert(allocator);
+    testing.expectEqual(expr2.value(), -6.0);
+    expr2.deinit();
+
+    // 6x - 6
+    expr2 = try expr.add(allocator, -6);
+    testing.expectEqual(expr2.value(), 0.0);
+    expr2.deinit();
+
+    // 6x + y
+    expr2 = try expr.add(allocator, &y);
+    testing.expectEqual(expr2.value(), 9.0);
+    expr2.deinit();
+
+    // 6x + 3y
+    expr2 = try expr.add(allocator, &y.mul(3));
+    testing.expectEqual(expr2.value(), 15.0);
+    expr2.deinit();
+
+    // 6x - y
+    expr2 = try expr.sub(allocator, &y);
+    testing.expectEqual(expr2.value(), 3.0);
+    //expr2.deinit();
+
+    // 6x + 6x - y
+    var expr3 = try expr.add(allocator, expr2);
+    testing.expectEqual(expr3.terms.items.len, 2);
+    testing.expectEqual(expr3.value(), 9.0);
+    //expr3.deinit();
+
+    var expr4 = try expr3.add(allocator, &z);
+    testing.expectEqual(expr4.terms.items.len, 3);
+    testing.expectEqual(expr4.value(), 11.0);
+}
 
 test "suggestions" {
     const testing = std.testing;
