@@ -17,7 +17,7 @@ pub const Variable = struct {
     context: ?usize = null,
 
     // -----------------------------------------------------------------------
-    // Multiply, Divide, and Invert
+    // Multiply, divide, and invert create terms
     // -----------------------------------------------------------------------
     pub inline fn mul(self: *Variable, coefficient: f32) Term {
         return Term{.variable=self, .coefficient=coefficient};
@@ -30,6 +30,19 @@ pub const Variable = struct {
     // Unary invert
     pub inline fn invert(self: *Variable) Term {
         return self.mul(-1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Add and subtract create expressions
+    // -----------------------------------------------------------------------
+    pub inline fn add(self: *Variable, allocator: *Allocator, other: var) !Expression {
+        var term = Term{.variable=self};
+        return term.add(allocator, other);
+    }
+
+    pub inline fn sub(self: *Variable, allocator: *Allocator, other: var) !Expression {
+        var term = Term{.variable=self};
+        return term.sub(allocator, other);
     }
 
     // -----------------------------------------------------------------------
@@ -72,7 +85,7 @@ pub const Term = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Multiply, Divide, and Invert
+    // Multiply, divide, and invert create terms
     // -----------------------------------------------------------------------
     pub inline fn mul(self: *Term, coefficient: f32) Term {
         return Term{
@@ -88,6 +101,23 @@ pub const Term = struct {
     // Unary invert
     pub inline fn invert(self: *Term) Term {
         return self.mul(-1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Add and subtract create expressions
+    // -----------------------------------------------------------------------
+    pub inline fn add(self: *Term, allocator: *Allocator, other: var) !Expression {
+        // No need to allocate here since expr.add makes a copy
+        var terms = Expression.Terms.fromOwnedSlice(allocator, &[_]Term{self.*});
+        var expr = Expression{.terms=terms};
+        return expr.add(allocator, other);
+    }
+
+    pub inline fn sub(self: *Term, allocator: *Allocator, other: var) !Expression {
+        // No need to allocate here since expr.sub makes a copy
+        var terms = Expression.Terms.fromOwnedSlice(allocator, &[_]Term{self.*});
+        var expr = Expression{.terms=terms};
+        return expr.sub(allocator, other);
     }
 
     // -----------------------------------------------------------------------
@@ -190,8 +220,8 @@ pub const Expression = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Multiply, Divide, and Invert
-    // ---------------size--------------------------------------------------------
+    // Multiply, divide, and invert
+    // -----------------------------------------------------------------------
     pub fn mul(self: *Expression, allocator: *Allocator, coefficient: f32) !Expression {
         var terms = try Terms.initCapacity(allocator, self.terms.items.len);
         for (self.terms.items) |*term| {
@@ -260,7 +290,6 @@ pub const Expression = struct {
 
 };
 
-// A namespace
 pub const Strength = struct {
     pub inline fn create(a: f32, b: f32, c: f32) f32 {
         return createWeighted(a, b, c, 1.0);
@@ -1291,7 +1320,9 @@ test "strength" {
 
 test "variables" {
     const testing = std.testing;
-    var v1 = Variable{.name="v1"};
+    const allocator = std.heap.page_allocator;
+    var v1 = Variable{.name="v1", .value=1.0};
+    var v2 = Variable{.name="v2", .value=2.0};
 
     var t = v1.invert();
     testing.expectEqual(t.coefficient, -1);
@@ -1303,10 +1334,22 @@ test "variables" {
     testing.expectEqual(t.coefficient, 0.5);
 
     testing.expectEqual(t.variable, &v1);
+
+    // Adding variables returns an expression
+    var expr = try v1.add(allocator, &v2);
+    testing.expectEqual(expr.terms.items.len, 2);
+    testing.expectEqual(expr.value(), 3.0);
+    expr.deinit();
+
+    expr = try v1.sub(allocator, &v2);
+    testing.expectEqual(expr.terms.items.len, 2);
+    testing.expectEqual(expr.value(), -1.0);
+    expr.deinit();
 }
 
 test "terms" {
     const testing = std.testing;
+    const allocator = std.heap.page_allocator;
     var x = Variable{.name="x", .value=2.0};
     var t1 = Term{.variable=&x};
 
@@ -1322,6 +1365,16 @@ test "terms" {
     t2 = t1.invert();
     testing.expectEqual(t2.coefficient, -1);
     testing.expectEqual(t2.value(), -2.0);
+
+    // Adding variables returns an expression
+    var expr = try t1.add(allocator, 3);
+    testing.expectEqual(expr.terms.items.len, 1);
+    testing.expectEqual(expr.value(), 5.0);
+    expr.deinit();
+
+    expr = try t1.add(allocator, &t2);
+    testing.expectEqual(expr.value(), 0.0);
+    expr.deinit();
 }
 
 test "expressions" {
@@ -1342,6 +1395,7 @@ test "expressions" {
         x.mul(2),
         x.mul(4),
     });
+    defer expr.deinit();
     testing.expectEqual(expr.terms.items.len, 1);
     testing.expectEqual(expr.value(), 6.0);
 
@@ -1391,6 +1445,11 @@ test "expressions" {
     testing.expectEqual(expr4.value(), 11.0);
 }
 
+test "constraints" {
+    // TODO:
+
+}
+
 test "suggestions" {
     const testing = std.testing;
     var buf: [10000]u8 = undefined;
@@ -1437,6 +1496,7 @@ test "suggestions" {
 }
 
 test "benchmark" {
+    // TODO:
     const testing = std.testing;
     var buf: [10000]u8 = undefined;
     const allocator = &std.heap.FixedBufferAllocator.init(&buf).allocator;
