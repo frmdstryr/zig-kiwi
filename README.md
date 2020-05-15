@@ -1,6 +1,8 @@
 # Zig-Cassowary
 
 [![Build Status](https://travis-ci.org/frmdstryr/zig-cassowary.svg?branch=master)](https://travis-ci.org/frmdstryr/zig-cassowary)
+[![codecov](https://codecov.io/gh/frmdstryr/zig-cassowary/branch/master/graph/badge.svg)](https://codecov.io/gh/frmdstryr/zig-cassowary)
+
 
 A port of the Cassowary constraint solver [Kiwi](https://github.com/nucleic/kiwi) to zig.
 
@@ -9,6 +11,8 @@ and zig doesn't support operator overloading or the allocator "magic" of C++.
 
 In practice this means constraints and expressions must manually be allocated
 and deallocated and pointers to variables used instead of copying them.
+
+> Note: This project is a WIP and is not fully tested.
 
 
 ### Example

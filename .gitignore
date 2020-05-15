@@ -3,3 +3,4 @@
 *.kdev4
 
 zig-cache/
+kcov-out/
