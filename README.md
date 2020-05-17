@@ -1,7 +1,7 @@
 # Zig-Cassowary
 
-[![Build Status](https://travis-ci.org/frmdstryr/zig-cassowary.svg?branch=master)](https://travis-ci.org/frmdstryr/zig-cassowary)
-[![codecov](https://codecov.io/gh/frmdstryr/zig-cassowary/branch/master/graph/badge.svg)](https://codecov.io/gh/frmdstryr/zig-cassowary)
+[![Build Status](https://travis-ci.org/frmdstryr/zig-kiwi.svg?branch=master)](https://travis-ci.org/frmdstryr/zig-kiwi)
+[![codecov](https://codecov.io/gh/frmdstryr/zig-kiwi/branch/master/graph/badge.svg)](https://codecov.io/gh/frmdstryr/zig-kiwi)
 
 
 A port of the Cassowary constraint solver [Kiwi](https://github.com/nucleic/kiwi) to zig.
