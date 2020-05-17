@@ -423,7 +423,7 @@ const Row = struct {
     }
 
     // Create a clone of the row using the original allocator
-    pub fn clone(self: *Row) !Row {
+    pub fn clone(self: Row) !Row {
         return Row{
             .cells = try self.cells.clone(),
             .constant = self.constant,
@@ -460,7 +460,7 @@ const Row = struct {
     // The constant and the cells of the other row will be multiplied by
     // the coefficient and added to this row. Any cell with a resulting
     // coefficient of zero will be removed from the row.
-    pub fn insertRow(self: *Row, row: *Row, coefficient: f32) !void {
+    pub fn insertRow(self: *Row, row: *const Row, coefficient: f32) !void {
         self.constant += row.constant * coefficient;
         var it = row.cells.iterator();
         while (it.next()) |item| {
@@ -518,7 +518,7 @@ const Row = struct {
 
     // Get the coefficient for the given symbol.
     // If the symbol does not exist in the row, zero will be returned.
-    pub inline fn coefficientFor(self: *const Row, symbol: Symbol) f32 {
+    pub inline fn coefficientFor(self: Row, symbol: Symbol) f32 {
         return if (self.cells.getValue(symbol)) |c| c else 0.0;
     }
 
@@ -529,7 +529,7 @@ const Row = struct {
     // expression 3 * a * y + a * c + b.
     //
     // If the symbol does not exist in the row, this is a no-op.
-    pub fn substitute(self: *Row, symbol: Symbol, row: *Row) !void {
+    pub fn substitute(self: *Row, symbol: Symbol, row: *const Row) !void {
         if (self.cells.get(symbol)) |cell| {
             self.removeSymbol(symbol);
             try self.insertRow(row, cell.value);
@@ -537,7 +537,7 @@ const Row = struct {
     }
 
     // Test whether a row is composed of all dummy variables.
-    pub fn isAllDummies(self: *const Row) bool {
+    pub fn isAllDummies(self: Row) bool {
         var it = self.cells.iterator();
         while (it.next()) |entry| {
             if (entry.key.tp != .Dummy) return false;
@@ -545,7 +545,7 @@ const Row = struct {
         return true;
     }
 
-    pub fn dumps(self: *Row) void {
+    pub fn dumps(self: Row) void {
         var it = self.cells.iterator();
         std.debug.warn("{d}", .{self.constant});
         while (it.next()) |entry| {
@@ -613,27 +613,13 @@ pub const Solver = struct {
     // -----------------------------------------------------------------------
     pub fn buildConstraint(self: *Solver, lhs: var, op: Constraint.Op,
                                   rhs: var, strength: f32) !Constraint {
-        var constant: f32 = 0;
-        var terms = Expression.Terms.init(self.allocator);
-        switch (@TypeOf(lhs)) {
-            comptime_int, f16, f32 => constant = @as(f32, lhs),
-            *Variable => try terms.append(Term{.variable=lhs}),
-            Term => try terms.append(lhs),
-            else => @compileError("Invalid lhs parameter")
-        }
-
-        switch (@TypeOf(rhs)) {
-            comptime_int, f16, f32 => constant += @as(f32, rhs),
-            *Variable => try terms.append(Term{.variable=rhs}),
-            Term => try terms.append(rhs),
-            else => @compileError("Invalid rhs parameter")
-        }
-
+        var expr = switch (@TypeOf(lhs)) {
+            *Expression, *Variable, *Term => try lhs.sub(self.allocator, rhs),
+            Expression, Variable, Term => @compileError("Pass a reference"),
+            else => @compileError("Invalid lhs expression"),
+        };
         return Constraint{
-            .expression = Expression{
-                .terms = terms,
-                .constant = constant,
-            },
+            .expression = expr,
             .op = op,
             .strength = strength,
         };
@@ -663,7 +649,7 @@ pub const Solver = struct {
         // i'm not too worried about aggressive cleanup of the var map.
         var tag = Tag{};
         var row = try self.createRow(constraint, &tag);
-        var subject = self.chooseSubject(&row, &tag);
+        var subject = self.chooseSubject(row, &tag);
 
         // If chooseSubject could not find a valid entering symbol, one
         // last option is available if the entire row is composed of
@@ -682,7 +668,7 @@ pub const Solver = struct {
         // be added using an artificial variable. If that fails, then
         // the row represents an unsatisfiable constraint.
         if (subject.tp == .Invalid) {
-            if (!try self.addWithArtificialVariable(&row)) {
+            if (!try self.addWithArtificialVariable(row)) {
                 return error.UnsatisfiableConstraint;
             }
         } else {
@@ -703,7 +689,7 @@ pub const Solver = struct {
     // Remove a constraint from the solver.
     pub fn removeConstraint(self: *Solver, constraint: *Constraint) !void {
         if (self.cns.remove(constraint)) |e| {
-            const tag = &e.value;
+            const tag = e.value;
 
             // Remove the error effects from the objective function
             // *before* pivoting, or substitutions into the objective
@@ -771,10 +757,11 @@ pub const Solver = struct {
         };
 
         try self.addConstraint(constraint);
-        _ = try self.edits.put(variable, EditInfo{
+        var info = EditInfo{
             .tag = &self.cns.get(constraint).?.value,
             .constraint = constraint,
-        });
+        };
+        _ = try self.edits.put(variable, info);
     }
 
     // Remove an edit variable from the solver.
@@ -811,43 +798,47 @@ pub const Solver = struct {
     //    The given edit variable has not been added to the solver.
     //
     pub fn suggestValue(self: *Solver, variable: *Variable, value: f32) !void {
-        if (self.edits.get(variable)) |edit| {
-            //defer self.dualOptimize();
-            const info = &edit.value;
+        if (self.edits.getValue(variable)) |*info| {
             const delta = value - info.constant;
             info.constant = value;
 
-            // Check first if the positive error variable is basic.
-            if (self.rows.get(info.tag.marker)) |entry| {
-                if (entry.value.add(-delta) < 0.0) {
-                    try self.infeasible_rows.append(entry.key);
-                }
-                return self.dualOptimize();
-            }
-
-            // Check next if the negative error variable is basic.
-            if (self.rows.get(info.tag.other)) |entry| {
-                if (entry.value.add(-delta) < 0.0) {
-                    try self.infeasible_rows.append(entry.key);
-                }
-                return self.dualOptimize();
-            }
-
-            // Otherwise update each row where the error variables exist.
-            var it = self.rows.iterator();
-            while (it.next()) |entry| {
-                const coeff = entry.value.coefficientFor(info.tag.marker);
-                if (coeff != 0.0 and entry.value.add(delta * coeff) < 0.0
-                        and entry.key.tp != .External) {
-                    try self.infeasible_rows.append(entry.key);
-                }
-            }
-            return self.dualOptimize();
+            // TODO: Ensure that dualOptimize is always called
+            try self.updateSuggestion(info, delta);
+            try self.dualOptimize();
         } else {
             return error.UnknownVariable;
         }
     }
 
+    // Helper function for suggested value
+    fn updateSuggestion(self: *Solver, info: *const EditInfo, delta: f32) !void {
+        // Check first if the positive error variable is basic.
+        if (self.rows.get(info.tag.marker)) |entry| {
+            if (entry.value.add(-delta) < 0.0) {
+                try self.infeasible_rows.append(entry.key);
+            }
+            return;
+        }
+
+        // Check next if the negative error variable is basic.
+        if (self.rows.get(info.tag.other)) |entry| {
+            if (entry.value.add(delta) < 0.0) {
+                try self.infeasible_rows.append(entry.key);
+            }
+            return;
+        }
+
+        // Otherwise update each row where the error variables exist.
+        var it = self.rows.iterator();
+        while (it.next()) |entry| {
+            const coeff = entry.value.coefficientFor(info.tag.marker);
+            if (coeff != 0.0
+                    and entry.value.add(delta * coeff) < 0.0
+                    and entry.key.tp != .External) {
+                try self.infeasible_rows.append(entry.key);
+            }
+        }
+    }
 
     // Update the values of the external solver variables.
     pub fn updateVariables(self: *Solver) void {
@@ -855,7 +846,7 @@ pub const Solver = struct {
         while (it.next()) |entry| {
             const v = entry.key;
             const sym = entry.value;
-            v.value = if (self.rows.get(sym)) |e| e.value.constant else 0.0;
+            v.value = if (self.rows.getValue(sym)) |row| row.constant else 0.0;
         }
     }
 
@@ -931,8 +922,7 @@ pub const Solver = struct {
         for (expr.terms.items) |term| {
             if (isNearZero(term.coefficient)) continue;
             const symbol = try self.getVarSymbol(term.variable);
-            if (self.rows.get(symbol)) |entry| {
-                const r = &entry.value;
+            if (self.rows.getValue(symbol)) |*r| {
                 try row.insertRow(r, term.coefficient);
             } else {
                 try row.insertSymbol(symbol, term.coefficient);
@@ -992,7 +982,7 @@ pub const Solver = struct {
     // 2) A negative slack or error tag variable.
     //
     // If a subject cannot be found, no symbol is returned.
-    fn chooseSubject(self: *Solver, row: *const Row, tag: *const Tag) Symbol {
+    fn chooseSubject(self: *Solver, row: Row, tag: *const Tag) Symbol {
         var it = row.cells.iterator();
         while (it.next()) |entry| {
             if (entry.key.tp == .External) {
@@ -1014,16 +1004,16 @@ pub const Solver = struct {
 
     // Add the row to the tableau using an artificial variable.
     // This will return false if the constraint cannot be satisfied.
-    fn addWithArtificialVariable(self: *Solver, row: *Row) !bool {
+    fn addWithArtificialVariable(self: *Solver, row: Row) !bool {
         // Create and add the artificial variable to the tableau
         const art = self.createSymbol(.Slack);
-        _ = try self.rows.put(art, try row.clone());
-        const artificial = &self.rows.get(art).?.value;
-        self.artificial = artificial;
+        var artificial = try row.clone();
+        _ = try self.rows.put(art, artificial);
+        self.artificial = &artificial;
 
         // Optimize the artificial objective. This is successful
         // only if the artificial objective is optimized to zero.
-        try self.optimize(artificial);
+        try self.optimize(&artificial);
         const success = isNearZero(artificial.constant);
         self.artificial = null;
 
@@ -1036,7 +1026,7 @@ pub const Solver = struct {
             if (self.getAnyPivotableSymbol(r)) |entering| {
                 try r.solveFor(art, entering);
                 try self.substitute(entering, r);
-                _ = try self.rows.put(entering, r.*);
+                _ = try self.rows.put(entering, entry.value);
             } else {
                 return false; // unsatisfiable (will this ever happen?)
             }
@@ -1057,7 +1047,7 @@ pub const Solver = struct {
     //
     // This method will substitute all instances of the parametric symbol
     // in the tableau and the objective function with the given row.
-    fn substitute(self: *Solver, symbol: Symbol, row: *Row) !void {
+    fn substitute(self: *Solver, symbol: Symbol, row: *const Row) !void {
         var it = self.rows.iterator();
         while (it.next()) |entry| {
             try entry.value.substitute(symbol, row);
@@ -1086,14 +1076,13 @@ pub const Solver = struct {
             if (self.getLeavingRow(entering)) |entry| {
                 // pivot the entering symbol into the basis
                 const leaving = entry.key;
-                _ = self.rows.remove(leaving);
                 const row = &entry.value;
+                assert(self.rows.remove(leaving) != null);
                 try row.solveFor(leaving, entering);
-                try self.substitute(leaving, row);
-                _ = try self.rows.put(entering, row.*);
+                try self.substitute(entering, row);
+                _ = try self.rows.put(entering, entry.value);
             } else {
-                // The objective is unbounded
-                return error.InternalSolverError;
+                return error.InternalSolverError; // The objective is unbounded
             }
         }
     }
@@ -1118,7 +1107,7 @@ pub const Solver = struct {
                         _ = self.rows.remove(leaving);
                         try row.solveFor(leaving, entering);
                         try self.substitute(entering, row);
-                        _ = try self.rows.put(entering, row.*);
+                        _ = try self.rows.put(entering, entry.value);
                     } else {
                         return error.InternalSolverError; // Dual optimize fail
                     }
@@ -1133,7 +1122,7 @@ pub const Solver = struct {
     // is non-dummy and has a coefficient less than zero. If no symbol meets
     // the criteria, it means the objective function is at a minimum and no
     // symbol is returned.
-    fn getEnteringSymbol(self: *Solver, row: *const Row) ?Symbol {
+    fn getEnteringSymbol(self: Solver, row: *const Row) ?Symbol {
         var it = row.cells.iterator();
         while (it.next()) |entry| {
             if (entry.key.tp != .Dummy and entry.value < 0.0) {
@@ -1149,7 +1138,7 @@ pub const Solver = struct {
     // coefficient and yields the minimum ratio for its respective symbol
     // in the objective function. The provided row *must* be infeasible.
     // If no symbol is found which meats the criteria, no symbol is returned.
-    fn getDualEnteringSymbol(self: *Solver, row: *Row) ?Symbol {
+    fn getDualEnteringSymbol(self: Solver, row: *const Row) ?Symbol {
         var ratio: f32 = std.math.f32_max;
         var symbol: ?Symbol = null;
         var it = row.cells.iterator();
@@ -1168,7 +1157,7 @@ pub const Solver = struct {
 
     // Get the first Slack or Error symbol in the row.
     // If no such symbol is present, no nsymbol is returned.
-    fn getAnyPivotableSymbol(self: *Solver, row: *Row) ?Symbol {
+    fn getAnyPivotableSymbol(self: Solver, row: *const Row) ?Symbol {
         var it = row.cells.iterator();
         while (it.next()) |entry| {
             if (entry.key.tp == .Slack or entry.key.tp == .Error) {
@@ -1184,19 +1173,21 @@ pub const Solver = struct {
     // which holds the exit symbol. If no appropriate exit symbol is
     // found, null is returned. This indicates that
     // the objective function is unbounded.
-    fn getLeavingRow(self: *Solver, entering: Symbol) ?*RowMap.KV {
+    fn getLeavingRow(self: Solver, entering: Symbol) ?*RowMap.KV {
         var ratio: f32 = std.math.f32_max;
         var result: ?*RowMap.KV = null;
 
         var it = self.rows.iterator();
         while (it.next()) |entry| {
-            if (entry.key.tp == .External) continue;
-            const coeff = entry.value.coefficientFor(entering);
-            if (coeff < 0.0) {
-                const r = -entry.value.constant / coeff;
-                if (r < ratio) {
-                    ratio = r;
-                    result = entry;
+            if (entry.key.tp != .External) {
+                const row = entry.value;
+                const coeff = row.coefficientFor(entering);
+                if (coeff < 0.0) {
+                    const r = -row.constant / coeff;
+                    if (r < ratio) {
+                        ratio = r;
+                        result = entry;
+                    }
                 }
             }
         }
@@ -1221,7 +1212,7 @@ pub const Solver = struct {
     // If the marker does not exist in any row, null will be returned.
     // This indicates an internal solver error since
     // the marker *should* exist somewhere in the tableau.
-    fn getMarkerLeavingRow(self: *Solver, marker: Symbol) ?*RowMap.KV {
+    fn getMarkerLeavingRow(self: Solver, marker: Symbol) ?*RowMap.KV {
         var r1: f32 = std.math.f32_max;
         var r2: f32 = std.math.f32_max;
         var first: ?*RowMap.KV = null;
@@ -1230,19 +1221,20 @@ pub const Solver = struct {
 
         var it = self.rows.iterator();
         while (it.next()) |entry| {
-            const c = entry.value.coefficientFor(marker);
+            const row = entry.value;
+            const c = row.coefficientFor(marker);
             if (c == 0) continue;
 
             if (entry.key.tp == .External) {
                 third = entry;
             } else if (c < 0.0) {
-                const r = -entry.value.constant / c;
+                const r = -row.constant / c;
                 if (r < r1) {
                     r1 = r;
                     first = entry;
                 }
             } else {
-                const r = entry.value.constant / c;
+                const r = row.constant / c;
                 if (r < r2) {
                     r2 = r;
                     second = entry;
@@ -1255,7 +1247,7 @@ pub const Solver = struct {
     }
 
     // Remove the effects of a constraint on the objective function.
-    fn removeConstraintEffects(self: *Solver, cn: *Constraint, tag: *const Tag) !void {
+    fn removeConstraintEffects(self: *Solver, cn: *const Constraint, tag: Tag) !void {
         if (tag.marker.tp == .Error) {
             try self.removeMarkerEffects(tag.marker, cn.strength);
         }
@@ -1266,15 +1258,15 @@ pub const Solver = struct {
 
     // Remove the effects of an error marker on the objective function.
     fn removeMarkerEffects(self: *Solver, marker: Symbol, strength: f32) !void {
-        if (self.rows.get(marker)) |entry| {
-            try self.objective.insertRow(&entry.value, -strength);
+        if (self.rows.getValue(marker)) |*row| {
+            try self.objective.insertRow(row, -strength);
         } else {
             try self.objective.insertSymbol(marker, -strength);
         }
     }
 
 
-    pub fn dumps(self: *Solver) void {
+    pub fn dumps(self: Solver) void {
         std.debug.warn("\nObjective\n---------\n", .{});
         self.objective.dumps();
 
@@ -1457,10 +1449,61 @@ test "constraints" {
 }
 
 
+
+test "row" {
+    const testing = std.testing;
+    const allocator = std.heap.page_allocator;
+    var row = Row.init(allocator);
+    testing.expectEqual(row.add(2.0), 2.0);
+    row.reverseSign();
+    testing.expectEqual(row.constant, -2.0);
+    testing.expectEqual(row.add(2.0), 0.0);
+
+
+    var e1 = Symbol{.id=1, .tp=.Error};
+    var e2 = Symbol{.id=2, .tp=.Error};
+    var e3 = Symbol{.id=3, .tp=.Error};
+
+    // Add symbols
+    try row.insertSymbol(e1, 2.0);
+    try row.insertSymbol(e2, 1.0);
+    testing.expectEqual(row.coefficientFor(e1), 2.0);
+    testing.expectEqual(row.coefficientFor(e2), 1.0);
+
+    // Re-add with reversed coeff, it should cancel
+    try row.insertSymbol(e1, -2.0);
+    testing.expectEqual(row.cells.get(e1), null);
+
+    try row.insertSymbol(e1, 2.0);
+    testing.expectEqual(row.coefficientFor(e1), 2.0);
+    testing.expectEqual(row.coefficientFor(e2), 1.0);
+
+
+    testing.expectError(error.CannotSolveForUnknownSymbol,
+                        row.solveForSymbol(e3));
+
+    // 2 + 2e1 + 1e2 = e3 --> e1 = e3 / 2 - e2 / 2 - 1
+    _ = row.add(2);
+    try row.solveFor(e3, e1);
+    testing.expectEqual(row.cells.get(e1), null); // Removes e1
+    testing.expectEqual(row.coefficientFor(e1), 0.0);
+    testing.expectEqual(row.coefficientFor(e2), -0.5);
+    testing.expectEqual(row.coefficientFor(e3), 0.5);
+    testing.expectEqual(row.constant, -1.0);
+
+    row.reverseSign();
+    testing.expectEqual(row.coefficientFor(e2), 0.5);
+    testing.expectEqual(row.coefficientFor(e3), -0.5);
+    testing.expectEqual(row.constant, 1.0);
+
+}
+
+
 test "solver-variable-managment" {
     const testing = std.testing;
     const allocator = std.heap.page_allocator;
     var solver = Solver.init(allocator);
+    defer solver.deinit();
     var v1 = Variable{.name="v1"};
     var v2 = Variable{.name="v2"};
 
@@ -1474,18 +1517,23 @@ test "solver-variable-managment" {
 
     testing.expect(solver.hasVariable(&v1));
 
+    // Already theres
     testing.expectError(error.DuplicateVariable,
         solver.addVariable(&v1, Strength.medium));
 
+    // Editable variables cannot have strength == required
     testing.expectError(error.BadRequiredStrength,
         solver.addVariable(&v2, Strength.required));
+    testing.expectEqual(solver.cns.size, 1); // Should still be 1
 
     // Not yet added
     testing.expect(!solver.hasVariable(&v2));
+
+    // Cant suggest a value that wasn't added
+    testing.expectError(error.UnknownVariable,
+        solver.suggestValue(&v2, 5.0));
     testing.expectError(error.UnknownVariable,
         solver.removeVariable(&v2));
-
-    testing.expectEqual(solver.cns.size, 1); // Should still be 1
 
     try solver.addVariable(&v2, Strength.medium);
     testing.expect(solver.hasVariable(&v2));
@@ -1498,92 +1546,176 @@ test "solver-variable-managment" {
     testing.expect(!solver.hasVariable(&v2));
 }
 
-test "suggestions" {
+test "suggestions-medium-suggestion-overrides-weak-constraint" {
     const testing = std.testing;
-    var buf: [10000]u8 = undefined;
-    const allocator = &std.heap.FixedBufferAllocator.init(&buf).allocator;
+    const allocator = std.heap.page_allocator;
     var solver = Solver.init(allocator);
+    defer solver.deinit();
     var v1 = Variable{.name="v1"};
-    var v2 = Variable{.name="v2"};
 
     // This builds a constraint
     try solver.addVariable(&v1, Strength.medium);
 
-    //var c = try v1.eql(allocator, 1, Strength.weak);
-    //defer c.deinit();
-
     var c = try solver.buildConstraint(&v1, .eq, 1, Strength.weak);
+    defer c.deinit();
     try solver.addConstraint(&c);
     testing.expectEqual(solver.cns.size, 2);
     testing.expect(solver.hasConstraint(&c));
     testing.expectError(error.DuplicateConstraint, solver.addConstraint(&c));
 
-
     try solver.suggestValue(&v1, 2);
-    testing.expectEqual(@as(f32, 2.0), solver.edits.getValue(&v1).?.constant);
+    //testing.expectEqual(@as(f32, 2.0), solver.edits.getValue(&v1).?.constant);
 
     solver.updateVariables();
 
+    //solver.dumps();
+
+    // Since v1 is medium it overwrites the weak constraint v1 == 1
+    testing.expectEqual(@as(f32, 2.0), v1.value);
+}
+
+test "suggestions-weak-suggestion-is-overriden-by-medium-constraint" {
+    //if (!@hasDecl(std, "crap")) return error.SkipZigTest;
+    const testing = std.testing;
+    const allocator = std.heap.page_allocator;
+    var solver = Solver.init(allocator);
+    var v1 = Variable{.name="v1"};
+
+    try solver.addVariable(&v1, Strength.weak);
+
+    var c = try solver.buildConstraint(&v1, .eq, 4, Strength.medium);
+    defer c.deinit();
+    try solver.addConstraint(&c);
+    try solver.suggestValue(&v1, 2);
+
+    solver.updateVariables();
+
+    //solver.dumps();
+
+    // Since v1 is weak is is now overridden by the medium constraint v1 == 1
+    testing.expectEqual(@as(f32, 4.0), v1.value);
+}
+
+test "suggestions-readme-example" {
+    //if (!@hasDecl(std, "crap")) return error.SkipZigTest;
+    const testing = std.testing;
+    const allocator = std.heap.page_allocator;
+    var solver = Solver.init(allocator);
+    defer solver.deinit();
+
+    var width = Variable{.name="width"};
+    var height = Variable{.name="height"};
+
+    try solver.addVariable(&width, Strength.medium);
+    try solver.addVariable(&height, Strength.medium);
+
+    // 16 * width = 9 * height
+    var aspect = try solver.buildConstraint(
+        &width.mul(3), .eq, &height.mul(4), Strength.strong);
+    defer aspect.deinit();
+    try solver.addConstraint(&aspect);
+
+    var min_width = try solver.buildConstraint(
+        &width, .gte, 320, Strength.strong);
+    defer min_width.deinit();
+    try solver.addConstraint(&min_width);
+
+    try solver.suggestValue(&height, 1);
     solver.dumps();
 
-    testing.expectEqual(@as(f32, 2.0), v1.value);
+    solver.updateVariables(); // Updates the interal value of every variable
 
+    testing.expectEqual(width.value, 320);
+    testing.expectEqual(height.value, 240);
 }
 
-test "benchmark" {
-    // TODO:
+test "suggestions-3" {
+    //if (!@hasDecl(std, "crap")) return error.SkipZigTest;
     const testing = std.testing;
-    var buf: [10000]u8 = undefined;
-    const allocator = &std.heap.FixedBufferAllocator.init(&buf).allocator;
+    const allocator = std.heap.page_allocator;
     var solver = Solver.init(allocator);
+    var v1 = Variable{.name="v1"};
+    var v2 = Variable{.name="v2"};
 
-    // Create custom strength
-    const mmedium = Strength.createWeighted(0, 1, 0, 1.25);
-    testing.expectEqual(mmedium, 1250.0);
-    const smedium = Strength.create(0, 100, 0);
-    testing.expectEqual(smedium, 100000.0);
+    try solver.addVariable(&v1, Strength.medium);
+    try solver.addVariable(&v2, Strength.medium);
+    var c = try solver.buildConstraint(&v1, .gte, 1, Strength.weak);
+    defer c.deinit();
+    try solver.addConstraint(&c);
 
-    // Create some variables
-    var left = Variable{.name="left"};
-    var height = Variable{.name="height"};
-    var top = Variable{.name="top"};
-    var width = Variable{.name="width"};
-    var contents_top = Variable{.name="contents_top"};
-    var contents_bottom = Variable{.name="contents_bottom"};
-    var contents_left = Variable{.name="contents_left"};
-    var contents_right = Variable{.name="contents_right"};
-    var midline = Variable{.name="midline"};
-    var ctleft = Variable{.name="ctleft"};
-    var ctheight = Variable{.name="ctheight"};
-    var cttop = Variable{.name="cttop"};
-    var ctwidth = Variable{.name="ctwidth"};
-    var lb1left = Variable{.name="lb1left"};
-    var lb1height = Variable{.name="lb1height"};
-    var lb1top = Variable{.name="lb1top"};
-    var lb1width = Variable{.name="lb1width"};
-    var lb2left = Variable{.name="lb2left"};
-    var lb2height = Variable{.name="lb2height"};
-    var lb2top = Variable{.name="lb2top"};
-    var lb2width = Variable{.name="lb2width"};
-    var lb3left = Variable{.name="lb3left"};
-    var lb3height = Variable{.name="lb3height"};
-    var lb3top = Variable{.name="lb3top"};
-    var lb3width = Variable{.name="lb3width"};
-    var fl1left = Variable{.name="fl1left"};
-    var fl1height = Variable{.name="fl1height"};
-    var fl1top = Variable{.name="fl1top"};
-    var fl1width = Variable{.name="fl1width"};
-    var fl2left = Variable{.name="fl2left"};
-    var fl2height = Variable{.name="fl2height"};
-    var fl2top = Variable{.name="fl2top"};
-    var fl2width = Variable{.name="fl2width"};
-    var fl3left = Variable{.name="fl3left"};
-    var fl3height = Variable{.name="fl3height"};
-    var fl3top = Variable{.name="fl3top"};
-    var fl3width = Variable{.name="fl3width"};
+    var expr = try v1.add(allocator, 10);
+    defer expr.deinit();
 
-    // Add the edit variables
-    try solver.addVariable(&width, Strength.strong);
-    try solver.addVariable(&height, Strength.strong);
+    // v2 >= v1 + 10
+    var c2 = try solver.buildConstraint(&v2, .gte, expr, Strength.strong);
+    defer c2.deinit();
+    try solver.addConstraint(&c2);
+
+    try solver.suggestValue(&v1, 2);
+
+    solver.updateVariables();
+    solver.dumps();
+    std.debug.warn("v1 = {}\n", .{v1.value});
+    std.debug.warn("v2 = {}\n", .{v2.value});
+    testing.expect(v1.value >= 1);
+    testing.expect(v2.value >= v1.value + 10);
 
 }
+
+// test "benchmark" {
+//     TODO:
+//     const testing = std.testing;
+//     var buf: [10000]u8 = undefined;
+//     const allocator = &std.heap.FixedBufferAllocator.init(&buf).allocator;
+//     var solver = Solver.init(allocator);
+//
+//     Create custom strength
+//     const mmedium = Strength.createWeighted(0, 1, 0, 1.25);
+//     testing.expectEqual(mmedium, 1250.0);
+//     const smedium = Strength.create(0, 100, 0);
+//     testing.expectEqual(smedium, 100000.0);
+//
+//     Create some variables
+//     var left = Variable{.name="left"};
+//     var height = Variable{.name="height"};
+//     var top = Variable{.name="top"};
+//     var width = Variable{.name="width"};
+//     var contents_top = Variable{.name="contents_top"};
+//     var contents_bottom = Variable{.name="contents_bottom"};
+//     var contents_left = Variable{.name="contents_left"};
+//     var contents_right = Variable{.name="contents_right"};
+//     var midline = Variable{.name="midline"};
+//     var ctleft = Variable{.name="ctleft"};
+//     var ctheight = Variable{.name="ctheight"};
+//     var cttop = Variable{.name="cttop"};
+//     var ctwidth = Variable{.name="ctwidth"};
+//     var lb1left = Variable{.name="lb1left"};
+//     var lb1height = Variable{.name="lb1height"};
+//     var lb1top = Variable{.name="lb1top"};
+//     var lb1width = Variable{.name="lb1width"};
+//     var lb2left = Variable{.name="lb2left"};
+//     var lb2height = Variable{.name="lb2height"};
+//     var lb2top = Variable{.name="lb2top"};
+//     var lb2width = Variable{.name="lb2width"};
+//     var lb3left = Variable{.name="lb3left"};
+//     var lb3height = Variable{.name="lb3height"};
+//     var lb3top = Variable{.name="lb3top"};
+//     var lb3width = Variable{.name="lb3width"};
+//     var fl1left = Variable{.name="fl1left"};
+//     var fl1height = Variable{.name="fl1height"};
+//     var fl1top = Variable{.name="fl1top"};
+//     var fl1width = Variable{.name="fl1width"};
+//     var fl2left = Variable{.name="fl2left"};
+//     var fl2height = Variable{.name="fl2height"};
+//     var fl2top = Variable{.name="fl2top"};
+//     var fl2width = Variable{.name="fl2width"};
+//     var fl3left = Variable{.name="fl3left"};
+//     var fl3height = Variable{.name="fl3height"};
+//     var fl3top = Variable{.name="fl3top"};
+//     var fl3width = Variable{.name="fl3width"};
+//
+//     Add the edit variables
+//     try solver.addVariable(&width, Strength.strong);
+//     try solver.addVariable(&height, Strength.strong);
+//
+// }
